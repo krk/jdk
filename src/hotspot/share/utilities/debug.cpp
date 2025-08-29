@@ -294,34 +294,78 @@ void report_java_out_of_memory(const char* message) {
 // Command object. It makes sure a resource mark is set and
 // flushes the logfile to prevent file sharing problems.
 
+#define COMMAND(name, requirement) \
+  Command c(name, requirement); \
+  if (!c.valid()) return;
+
+#define COMMAND_RET_PTR(name, requirement) \
+  Command c(name, requirement); \
+  if (!c.valid()) return nullptr;
+
+#define COMMAND_RET_NUM(name, requirement) \
+  Command c(name, requirement); \
+  if (!c.valid()) return 0;
+
+typedef enum {
+    REQUIRES_NONE = 1,
+    REQUIRES_THREAD = 2,
+    REQUIRES_JAVA_THREAD = 3,
+} needsThread;
+
+
 class Command : public StackObj {
  private:
-  ResourceMark _rm;
-  DebuggingContext _debugging;
- public:
   static int level;
-  Command(const char* str) {
-    if (level++ > 0)  return;
-    tty->cr();
-    tty->print_cr("\"Executing %s\"", str);
+  DebuggingContext _debugging;
+  // ResourceMark is only created if a Thread or a JavaThread is required,
+  // and we are actually on a Thread.
+  union { ResourceMark _rm; };
+  bool _has_rm;
+  bool _valid;
+ public:
+  Command(const char* str, needsThread needs) : _has_rm(false), _valid(true) {
+    if (level++ == 0) {
+      tty->cr();
+      tty->print_cr("\"Executing %s\"", str);
+    }
+    if (needs == REQUIRES_NONE) {
+      return;
+    }
+    tty->flush();
+    Thread* thread = Thread::current_or_null();
+    if (thread == nullptr) {
+      tty->print_cr("Failed: Current thread is not attached");
+      _valid = false;
+      return;
+    }
+    ::new (&_rm) ResourceMark();
+    _has_rm = true;
+    if (needs == REQUIRES_JAVA_THREAD && JavaThread::active() == nullptr) {
+      tty->print_cr("Failed: Current thread is not a java thread or the vm thread");
+      _valid = false;
+      return;
+    }
   }
-
   ~Command() {
+    if (_has_rm) {
+      _rm.~ResourceMark();
+    }
     tty->flush();
     level--;
   }
+  bool valid() const { return _valid; }
 };
 
 int Command::level = 0;
 
 extern "C" DEBUGEXPORT void blob(CodeBlob* cb) {
-  Command c("blob");
+  COMMAND("blob", REQUIRES_NONE);
   cb->print();
 }
 
 
 extern "C" DEBUGEXPORT void dump_vtable(address p) {
-  Command c("dump_vtable");
+  COMMAND("dump_vtable", REQUIRES_NONE);
   Klass* k = (Klass*)p;
   k->vtable().print();
 }
@@ -329,7 +373,7 @@ extern "C" DEBUGEXPORT void dump_vtable(address p) {
 
 extern "C" DEBUGEXPORT void nm(intptr_t p) {
   // Actually we look through all CodeBlobs (the nm name has been kept for backwards compatibility)
-  Command c("nm");
+  COMMAND("nm", REQUIRES_NONE);
   CodeBlob* cb = CodeCache::find_blob((address)p);
   if (cb == nullptr) {
     tty->print_cr("null");
@@ -340,7 +384,7 @@ extern "C" DEBUGEXPORT void nm(intptr_t p) {
 
 
 extern "C" DEBUGEXPORT void disnm(intptr_t p) {
-  Command c("disnm");
+  COMMAND("disnm", REQUIRES_NONE);
   CodeBlob* cb = CodeCache::find_blob((address) p);
   if (cb != nullptr) {
     nmethod* nm = cb->as_nmethod_or_null();
@@ -357,7 +401,7 @@ extern "C" DEBUGEXPORT void disnm(intptr_t p) {
 extern "C" DEBUGEXPORT void printnm(intptr_t p) {
   char buffer[256];
   os::snprintf_checked(buffer, sizeof(buffer), "printnm: " INTPTR_FORMAT, p);
-  Command c(buffer);
+  COMMAND(buffer, REQUIRES_NONE);
   CodeBlob* cb = CodeCache::find_blob((address) p);
   if (cb != nullptr && cb->is_nmethod()) {
     nmethod* nm = (nmethod*)cb;
@@ -369,7 +413,7 @@ extern "C" DEBUGEXPORT void printnm(intptr_t p) {
 
 
 extern "C" DEBUGEXPORT void universe() {
-  Command c("universe");
+  COMMAND("universe", REQUIRES_THREAD);
   Universe::print_on(tty);
 }
 
@@ -378,7 +422,7 @@ extern "C" DEBUGEXPORT void verify() {
   // try to run a verify on the entire system
   // note: this may not be safe if we're not at a safepoint; for debugging,
   // this manipulates the safepoint settings to avoid assertion failures
-  Command c("universe verify");
+  COMMAND("universe verify", REQUIRES_THREAD);
   bool safe = SafepointSynchronize::is_at_safepoint();
   if (!safe) {
     tty->print_cr("warning: not at safepoint -- verify may fail");
@@ -392,7 +436,7 @@ extern "C" DEBUGEXPORT void verify() {
 
 
 extern "C" DEBUGEXPORT void pp(void* p) {
-  Command c("pp");
+  COMMAND("pp", REQUIRES_THREAD);
   FlagSetting fl(DisplayVMOutput, true);
   if (p == nullptr) {
     tty->print_cr("null");
@@ -419,8 +463,7 @@ extern "C" DEBUGEXPORT void pp(void* p) {
 extern "C" DEBUGEXPORT void findpc(intptr_t x);
 
 extern "C" DEBUGEXPORT void ps() { // print stack
-  if (Thread::current_or_null() == nullptr) return;
-  Command c("ps");
+  COMMAND("ps", REQUIRES_JAVA_THREAD);
 
   // Prints the stack of the current Java thread
   JavaThread* p = JavaThread::active();
@@ -449,7 +492,7 @@ extern "C" DEBUGEXPORT void ps() { // print stack
 
 extern "C" DEBUGEXPORT void pfl() {
   // print frame layout
-  Command c("pfl");
+  COMMAND("pfl", REQUIRES_JAVA_THREAD);
   JavaThread* p = JavaThread::active();
   tty->print(" for thread: ");
   p->print();
@@ -460,41 +503,38 @@ extern "C" DEBUGEXPORT void pfl() {
 }
 
 extern "C" DEBUGEXPORT void psf() { // print stack frames
-  {
-    Command c("psf");
-    JavaThread* p = JavaThread::active();
-    tty->print(" for thread: ");
-    p->print();
-    tty->cr();
-    if (p->has_last_Java_frame()) {
-      p->trace_frames();
-    }
+  COMMAND("psf", REQUIRES_JAVA_THREAD);
+  JavaThread* p = JavaThread::active();
+  tty->print(" for thread: ");
+  p->print();
+  tty->cr();
+  if (p->has_last_Java_frame()) {
+    p->trace_frames();
   }
 }
 
 
 extern "C" DEBUGEXPORT void threads() {
-  Command c("threads");
+  COMMAND("threads", REQUIRES_THREAD);
   Threads::print(false, true);
 }
 
 
 extern "C" DEBUGEXPORT void psd() {
-  Command c("psd");
+  COMMAND("psd", REQUIRES_THREAD);
   SystemDictionary::print();
 }
 
 
 extern "C" DEBUGEXPORT void pss() { // print all stacks
-  if (Thread::current_or_null() == nullptr) return;
-  Command c("pss");
+  COMMAND("pss", REQUIRES_THREAD);
   Threads::print(true, PRODUCT_ONLY(false) NOT_PRODUCT(true));
 }
 
 // #ifndef PRODUCT
 
 extern "C" DEBUGEXPORT void debug() {               // to set things up for compiler debugging
-  Command c("debug");
+  COMMAND("debug", REQUIRES_NONE);
   NOT_PRODUCT(WizardMode = true;)
   PrintCompilation = true;
   PrintInlining = PrintAssembly = true;
@@ -503,7 +543,7 @@ extern "C" DEBUGEXPORT void debug() {               // to set things up for comp
 
 
 extern "C" DEBUGEXPORT void ndebug() {              // undo debug()
-  Command c("ndebug");
+  COMMAND("ndebug", REQUIRES_NONE);
   PrintCompilation = false;
   PrintInlining = PrintAssembly = false;
   tty->flush();
@@ -511,35 +551,35 @@ extern "C" DEBUGEXPORT void ndebug() {              // undo debug()
 
 
 extern "C" DEBUGEXPORT void flush()  {
-  Command c("flush");
+  COMMAND("flush", REQUIRES_NONE);
   tty->flush();
 }
 
 extern "C" DEBUGEXPORT void events() {
-  Command c("events");
+  COMMAND("events", REQUIRES_NONE);
   Events::print();
 }
 
 extern "C" DEBUGEXPORT Method* findm(intptr_t pc) {
-  Command c("findm");
+  COMMAND_RET_PTR("findm", REQUIRES_NONE);
   nmethod* nm = CodeCache::find_nmethod((address)pc);
   return (nm == nullptr) ? (Method*)nullptr : nm->method();
 }
 
 
 extern "C" DEBUGEXPORT nmethod* findnm(intptr_t addr) {
-  Command c("findnm");
+  COMMAND_RET_PTR("findnm", REQUIRES_NONE);
   return  CodeCache::find_nmethod((address)addr);
 }
 
 extern "C" DEBUGEXPORT void find(intptr_t x) {
-  Command c("find");
+  COMMAND("find", REQUIRES_THREAD);
   os::print_location(tty, x, false);
 }
 
 
 extern "C" DEBUGEXPORT void findpc(intptr_t x) {
-  Command c("findpc");
+  COMMAND("findpc", REQUIRES_THREAD);
   os::print_location(tty, x, true);
 }
 
@@ -550,21 +590,21 @@ extern "C" DEBUGEXPORT void findpc(intptr_t x) {
 //   call findmethod("*ang/Object*", "wait", 0xff)       -> detailed disasm of all "wait" methods in j.l.Object
 //   call findmethod("*ang/Object*", "wait:(*J*)V", 0x1) -> list all "wait" methods in j.l.Object that have a long parameter
 extern "C" DEBUGEXPORT void findclass(const char* class_name_pattern, int flags) {
-  Command c("findclass");
+  COMMAND("findclass", REQUIRES_THREAD);
   ClassPrinter::print_flags_help(tty);
   ClassPrinter::print_classes(class_name_pattern, flags, tty);
 }
 
 extern "C" DEBUGEXPORT void findmethod(const char* class_name_pattern,
                                      const char* method_pattern, int flags) {
-  Command c("findmethod");
+  COMMAND("findmethod", REQUIRES_THREAD);
   ClassPrinter::print_flags_help(tty);
   ClassPrinter::print_methods(class_name_pattern, method_pattern, flags, tty);
 }
 
 // Need method pointer to find bcp
 extern "C" DEBUGEXPORT void findbcp(intptr_t method, intptr_t bcp) {
-  Command c("findbcp");
+  COMMAND("findbcp", REQUIRES_NONE);
   Method* mh = (Method*)method;
   if (!mh->is_native()) {
     tty->print_cr("bci_from(%p) = %d; print_codes():",
@@ -575,7 +615,7 @@ extern "C" DEBUGEXPORT void findbcp(intptr_t method, intptr_t bcp) {
 
 // check and decode a single u5 value
 extern "C" DEBUGEXPORT u4 u5decode(intptr_t addr) {
-  Command c("u5decode");
+  COMMAND_RET_NUM("u5decode", REQUIRES_NONE);
   u1* arr = (u1*)addr;
   size_t off = 0, lim = 5;
   if (!UNSIGNED5::check_length(arr, off, lim)) {
@@ -594,7 +634,7 @@ extern "C" DEBUGEXPORT u4 u5decode(intptr_t addr) {
 extern "C" DEBUGEXPORT intptr_t u5p(intptr_t addr,
                                   intptr_t limit,
                                   int count) {
-  Command c("u5p");
+  COMMAND_RET_NUM("u5p", REQUIRES_NONE);
   u1* arr = (u1*)addr;
   if (limit && limit < addr)  limit = addr;
   size_t lim = !limit ? 0 : (limit - addr);
@@ -610,7 +650,7 @@ void pp(intptr_t p)          { pp((void*)p); }
 void pp(oop p)               { pp((void*)p); }
 
 void help() {
-  Command c("help");
+  COMMAND("help", REQUIRES_NONE);
   tty->print_cr("basic");
   tty->print_cr("  pp(void* p)   - try to make sense of p");
   tty->print_cr("  ps()          - print current thread stack");
@@ -643,7 +683,7 @@ void help() {
 
 #ifndef PRODUCT
 extern "C" DEBUGEXPORT void pns(void* sp, void* fp, void* pc) { // print native stack
-  Command c("pns");
+  COMMAND("pns", REQUIRES_THREAD);
   static char buf[O_BUFLEN];
   // Call generic frame constructor (certain arguments may be ignored)
   frame fr(sp, fp, pc);
@@ -661,7 +701,7 @@ extern "C" DEBUGEXPORT void pns(void* sp, void* fp, void* pc) { // print native 
 // pns2() in committed source (product or debug).
 //
 extern "C" DEBUGEXPORT void pns2() { // print native stack
-  Command c("pns2");
+  COMMAND("pns2", REQUIRES_THREAD);
   static char buf[O_BUFLEN];
   address lastpc = nullptr;
   NativeStackPrinter nsp(Thread::current_or_null());
