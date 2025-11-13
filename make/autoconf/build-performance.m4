@@ -176,7 +176,7 @@ AC_DEFUN([BPERF_SETUP_CCACHE],
   fi
 
   CCACHE_STATUS=""
-  UTIL_ARG_ENABLE(NAME: ccache, DEFAULT: false, AVAILABLE: $CCACHE_AVAILABLE,
+  UTIL_ARG_ENABLE(NAME: ccache, DEFAULT: true, AVAILABLE: $CCACHE_AVAILABLE,
       DESC: [enable using ccache to speed up recompilations],
       CHECKING_MSG: [if ccache is enabled],
       IF_ENABLED: [
