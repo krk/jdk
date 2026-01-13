@@ -334,8 +334,10 @@ Node* PhaseVector::expand_vbox_node_helper(Node* vbox,
   // inputs of two VectorBox nodes are in Phi2.
   //
   // See PhiNode::merge_through_phi in cfg.cpp for more details.
-  if (vbox->is_Phi() && vect->is_Phi()) {
-    assert(vbox->as_Phi()->region() == vect->as_Phi()->region(), "");
+  //
+  // IGVN can replace vect Phi with a different-region Phi, check for same region.
+  if (vbox->is_Phi() && vect->is_Phi() &&
+      vbox->as_Phi()->region() == vect->as_Phi()->region()) {
     for (uint i = 1; i < vbox->req(); i++) {
       Node* new_box = expand_vbox_node_helper(vbox->in(i), vect->in(i),
                                               box_type, vect_type, visited);
