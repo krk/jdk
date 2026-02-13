@@ -267,8 +267,8 @@ void Parse::do_new() {
     C->set_has_stringbuilder(true);
   }
 
-  // Keep track of boxed values for EliminateAutoBox optimizations.
-  if (C->eliminate_boxing() && klass->is_box_klass()) {
+  // Keep track of boxed values for EliminateAutoBox and AggressiveUnboxing optimizations.
+  if (C->eliminate_boxing() && (klass->is_box_klass() || (DetectBoxlike && klass->is_boxlike_klass()))) {
     C->set_has_boxed_value(true);
   }
 }

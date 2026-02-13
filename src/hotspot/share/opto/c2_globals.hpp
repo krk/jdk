@@ -535,6 +535,9 @@
   product(bool, AggressiveUnboxing, true, DIAGNOSTIC,                       \
           "Control optimizations for aggressive boxing elimination")        \
                                                                             \
+  product(bool, DetectBoxlike, true, DIAGNOSTIC,                            \
+          "Detect box-like classes for aggressive unboxing")                \
+                                                                            \
   develop(bool, TracePostallocExpand, false, "Trace expanding nodes after"  \
           " register allocation.")                                          \
                                                                             \

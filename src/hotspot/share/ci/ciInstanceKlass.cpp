@@ -258,12 +258,25 @@ bool ciInstanceKlass::is_box_klass() const {
 }
 
 /**
+ * Is this a box-like value klass?  That is, a final, loaded class from
+ * a trusted class loader with exactly one nonstatic field of a Java
+ * primitive type. This covers types like Float16 that are structurally
+ * equivalent to standard box types but are not recognized by
+ * is_box_klass().
+ */
+bool ciInstanceKlass::is_boxlike_klass() {
+  return is_loaded() && is_final() && has_trusted_loader() && nof_nonstatic_fields() == 1 &&
+    !is_box_klass() && is_java_primitive(nonstatic_field_at(0)->layout_type());
+}
+
+/**
  *  Is this boxed value offset?
  */
-bool ciInstanceKlass::is_boxed_value_offset(int offset) const {
+bool ciInstanceKlass::is_boxed_value_offset(int offset) {
   BasicType bt = box_klass_type();
-  return is_java_primitive(bt) &&
-         (offset == java_lang_boxing_object::value_offset(bt));
+  return is_java_primitive(bt)
+    ? offset == java_lang_boxing_object::value_offset(bt)
+    : DetectBoxlike && is_boxlike_klass() && offset == nonstatic_field_at(0)->offset_in_bytes();
 }
 
 // ------------------------------------------------------------------
