@@ -237,8 +237,8 @@ public class VectorMaskToLongTest {
     }
 
     @Test
-    @IR(counts = { IRNode.VECTOR_LONG_TO_MASK, "= 1",
-                   IRNode.VECTOR_MASK_TO_LONG, "= 1" },
+    @IR(counts = { IRNode.VECTOR_LONG_TO_MASK, "= 0",
+                   IRNode.VECTOR_MASK_TO_LONG, "= 0" },
         applyIfCPUFeatureOr = { "svebitperm", "true", "avx2", "true", "rvv", "true" })
     @IR(counts = { IRNode.VECTOR_LONG_TO_MASK, "= 0",
                    IRNode.VECTOR_MASK_TO_LONG, "= 1" },
@@ -251,8 +251,8 @@ public class VectorMaskToLongTest {
     }
 
     @Test
-    @IR(counts = { IRNode.VECTOR_LONG_TO_MASK, "= 1",
-                   IRNode.VECTOR_MASK_TO_LONG, "= 1" },
+    @IR(counts = { IRNode.VECTOR_LONG_TO_MASK, "= 0",
+                   IRNode.VECTOR_MASK_TO_LONG, "= 0" },
         applyIfCPUFeatureOr = { "svebitperm", "true", "avx2", "true", "rvv", "true" })
     @IR(counts = { IRNode.VECTOR_LONG_TO_MASK, "= 0",
                    IRNode.VECTOR_MASK_TO_LONG, "= 1" },
