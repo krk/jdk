@@ -46,6 +46,7 @@
 #include "memory/arena.hpp"
 #include "memory/resourceArea.hpp"
 #include "opto/addnode.hpp"
+#include "opto/arraycopynode.hpp"
 #include "opto/block.hpp"
 #include "opto/c2compiler.hpp"
 #include "opto/callGenerator.hpp"
@@ -265,6 +266,7 @@ void Compile::print_statistics() {
     PhaseIdealLoop::print_statistics();
     ConnectionGraph::print_statistics();
     PhaseMacroExpand::print_statistics();
+    ArrayCopyNode::print_opt_small_statistics();
     if (xtty != nullptr)  xtty->tail("statistics");
   }
   if (_intrinsic_hist_flags[as_int(vmIntrinsics::_none)] != 0) {

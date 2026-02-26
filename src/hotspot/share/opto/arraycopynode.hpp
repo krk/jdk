@@ -30,6 +30,19 @@
 
 class GraphKit;
 
+struct ArrayCopyAddr {
+  const TypePtr* atp;
+  Node* adr;
+  Node* base;
+};
+
+struct ArrayCopyType {
+  BasicType type;
+  const Type* value_type;
+  int min_count;
+  int max_count;
+};
+
 class ArrayCopyNode : public CallNode {
   static const TypeFunc* _arraycopy_type_Type;
 private:
@@ -100,25 +113,25 @@ private:
 
   intptr_t get_length_if_constant(PhaseGVN *phase) const;
   int get_count(PhaseGVN *phase) const;
-  static const TypePtr* get_address_type(PhaseGVN* phase, const TypePtr* atp, Node* n);
 
   Node* try_clone_instance(PhaseGVN *phase, bool can_reshape, int count);
-  bool prepare_array_copy(PhaseGVN *phase, bool can_reshape,
-                          Node*& adr_src, Node*& base_src, Node*& adr_dest, Node*& base_dest,
-                          BasicType& copy_type, const Type*& value_type, bool& disjoint_bases);
+  bool prepare_array_copy(PhaseGVN *phase, bool can_reshape, ArrayCopyAddr& src, ArrayCopyAddr& dest,
+                          ArrayCopyType& elem, bool& disjoint_bases);
   void array_copy_test_overlap(PhaseGVN *phase, bool can_reshape,
                                bool disjoint_bases, int count,
                                Node*& forward_ctl, Node*& backward_ctl);
-  Node* array_copy_forward(PhaseGVN *phase, bool can_reshape, Node*& ctl,
-                           Node* mem,
-                           const TypePtr* atp_src, const TypePtr* atp_dest,
-                           Node* adr_src, Node* base_src, Node* adr_dest, Node* base_dest,
-                           BasicType copy_type, const Type* value_type, int count);
-  Node* array_copy_backward(PhaseGVN *phase, bool can_reshape, Node*& ctl,
-                            Node* mem,
-                            const TypePtr* atp_src, const TypePtr* atp_dest,
-                            Node* adr_src, Node* base_src, Node* adr_dest, Node* base_dest,
-                            BasicType copy_type, const Type* value_type, int count);
+  inline void copy_element(BarrierSetC2* bs, PhaseGVN* phase, Node*& ctl, MergeMemNode* mm,
+                           ArrayCopyAddr src, ArrayCopyAddr dest, ArrayCopyType elem, int i);
+  bool copy_chunk(PhaseGVN* phase, BarrierSetC2* bs,
+                  Node*& copy_ctl, MergeMemNode* mm,
+                  ArrayCopyAddr src, ArrayCopyAddr dest, ArrayCopyType elem,
+                  int alias_idx, int chunk_size, Node* chunk_off);
+  Node* array_copy_forward(PhaseGVN *phase, bool can_reshape, Node*& ctl, Node* mem,
+                           ArrayCopyAddr src, ArrayCopyAddr dest, ArrayCopyType elem);
+  Node* array_copy_forward_variable(PhaseGVN *phase, bool can_reshape, Node*& ctl, Node* mem,
+                                    ArrayCopyAddr src, ArrayCopyAddr dest, ArrayCopyType elem);
+  Node* array_copy_backward(PhaseGVN *phase, bool can_reshape, Node*& ctl, Node* mem,
+                            ArrayCopyAddr src, ArrayCopyAddr dest, ArrayCopyType elem);
   bool finish_transform(PhaseGVN *phase, bool can_reshape,
                         Node* ctl, Node *mem);
   static bool may_modify_helper(const TypeOopPtr* t_oop, Node* n, PhaseValues* phase, ArrayCopyNode*& ac);
@@ -198,6 +211,7 @@ public:
 #ifndef PRODUCT
   virtual void dump_spec(outputStream *st) const;
   virtual void dump_compact_spec(outputStream* st) const;
+  static void print_opt_small_statistics();
 #endif
 };
 #endif // SHARE_OPTO_ARRAYCOPYNODE_HPP

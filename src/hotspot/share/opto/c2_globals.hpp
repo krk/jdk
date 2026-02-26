@@ -826,6 +826,9 @@
           "loads/stores")                                                   \
           range(0, max_intx)                                                \
                                                                             \
+  product(bool, OptSmallArrayCopy, true, DIAGNOSTIC,                        \
+          "Inline small arraycopy with non-constant but bounded length")    \
+                                                                            \
   develop(bool, StressArrayCopyMacroNode, false,                            \
           "Perform ArrayCopy load/store replacement during IGVN only")      \
                                                                             \

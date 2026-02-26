@@ -27,10 +27,21 @@
 #include "gc/shared/c2/cardTableBarrierSetC2.hpp"
 #include "gc/shared/gc_globals.hpp"
 #include "opto/arraycopynode.hpp"
+#include "opto/addnode.hpp"
+#include "opto/convertnode.hpp"
 #include "opto/graphKit.hpp"
+#include "opto/matcher.hpp"
+#include "opto/vectornode.hpp"
 #include "utilities/powerOfTwo.hpp"
 
 const TypeFunc* ArrayCopyNode::_arraycopy_type_Type = nullptr;
+
+#ifndef PRODUCT
+// Histograms for OptSmallArrayCopy diagnostics: [BasicType][max_count].
+// max_count index 0 is unused; valid range is [1..8] (ArrayCopyLoadStoreMaxElem).
+// Plain (non-atomic) counters: slight over/undercount under races is fine.
+static volatile int _opt_small_counts[T_LONG + 1][9];
+#endif
 
 ArrayCopyNode::ArrayCopyNode(Compile* C, bool alloc_tightly_coupled, bool has_negative_length_guard)
   : CallNode(arraycopy_type(), nullptr, TypePtr::BOTTOM),
@@ -259,23 +270,22 @@ Node* ArrayCopyNode::try_clone_instance(PhaseGVN *phase, bool can_reshape, int c
 }
 
 bool ArrayCopyNode::prepare_array_copy(PhaseGVN *phase, bool can_reshape,
-                                       Node*& adr_src,
-                                       Node*& base_src,
-                                       Node*& adr_dest,
-                                       Node*& base_dest,
-                                       BasicType& copy_type,
-                                       const Type*& value_type,
+                                       ArrayCopyAddr& src,
+                                       ArrayCopyAddr& dest,
+                                       ArrayCopyType& elem,
                                        bool& disjoint_bases) {
-  base_src = in(ArrayCopyNode::Src);
-  base_dest = in(ArrayCopyNode::Dest);
-  const Type* src_type = phase->type(base_src);
+  src.base = in(ArrayCopyNode::Src);
+  dest.base = in(ArrayCopyNode::Dest);
+  src.adr = nullptr;
+  dest.adr = nullptr;
+  const Type* src_type = phase->type(src.base);
   const TypeAryPtr* ary_src = src_type->isa_aryptr();
 
   Node* src_offset = in(ArrayCopyNode::SrcPos);
   Node* dest_offset = in(ArrayCopyNode::DestPos);
 
   if (is_arraycopy() || is_copyofrange() || is_copyof()) {
-    const Type* dest_type = phase->type(base_dest);
+    const Type* dest_type = phase->type(dest.base);
     const TypeAryPtr* ary_dest = dest_type->isa_aryptr();
 
     // newly allocated object is guaranteed to not overlap with source object
@@ -303,7 +313,7 @@ bool ArrayCopyNode::prepare_array_copy(PhaseGVN *phase, bool can_reshape,
       return false;
     }
 
-    value_type = ary_src->elem();
+    elem.value_type = ary_src->elem();
 
     uint shift  = exact_log2(type2aelembytes(dest_elem));
     uint header = arrayOopDesc::base_offset_in_bytes(dest_elem);
@@ -332,55 +342,53 @@ bool ArrayCopyNode::prepare_array_copy(PhaseGVN *phase, bool can_reshape,
 
     Node* dest_scale = phase->transform(new LShiftXNode(dest_offset, phase->intcon(shift)));
 
-    adr_src          = phase->transform(new AddPNode(base_src, base_src, src_scale));
-    adr_dest         = phase->transform(new AddPNode(base_dest, base_dest, dest_scale));
+    src.adr = phase->transform(new AddPNode(src.base, src.base, src_scale));
+    dest.adr = phase->transform(new AddPNode(dest.base, dest.base, dest_scale));
 
-    adr_src          = phase->transform(new AddPNode(base_src, adr_src, phase->MakeConX(header)));
-    adr_dest         = phase->transform(new AddPNode(base_dest, adr_dest, phase->MakeConX(header)));
+    src.adr = phase->transform(new AddPNode(src.base, src.adr, phase->MakeConX(header)));
+    dest.adr = phase->transform(new AddPNode(dest.base, dest.adr, phase->MakeConX(header)));
 
-    copy_type = dest_elem;
+    elem.type = dest_elem;
   } else {
     assert(ary_src != nullptr, "should be a clone");
     assert(is_clonebasic(), "should be");
 
     disjoint_bases = true;
 
-    BasicType elem = ary_src->isa_aryptr()->elem()->array_element_basic_type();
-    if (is_reference_type(elem, true)) {
-      elem = T_OBJECT;
+    BasicType bt = ary_src->isa_aryptr()->elem()->array_element_basic_type();
+    if (is_reference_type(bt, true)) {
+      bt = T_OBJECT;
     }
 
     BarrierSetC2* bs = BarrierSet::barrier_set()->barrier_set_c2();
-    if (bs->array_copy_requires_gc_barriers(true, elem, true, is_clone_inst(), BarrierSetC2::Optimization)) {
+    if (bs->array_copy_requires_gc_barriers(true, bt, true, is_clone_inst(), BarrierSetC2::Optimization)) {
       return false;
     }
 
-    adr_src  = phase->transform(new AddPNode(base_src, base_src, src_offset));
-    adr_dest = phase->transform(new AddPNode(base_dest, base_dest, dest_offset));
+    src.adr = phase->transform(new AddPNode(src.base, src.base, src_offset));
+    dest.adr = phase->transform(new AddPNode(dest.base, dest.base, dest_offset));
 
     // The address is offsetted to an aligned address where a raw copy would start.
     // If the clone copy is decomposed into load-stores - the address is adjusted to
     // point at where the array starts.
     const Type* toff = phase->type(src_offset);
     int offset = toff->isa_long() ? (int) toff->is_long()->get_con() : (int) toff->is_int()->get_con();
-    int diff = arrayOopDesc::base_offset_in_bytes(elem) - offset;
+    int diff = arrayOopDesc::base_offset_in_bytes(bt) - offset;
     assert(diff >= 0, "clone should not start after 1st array element");
     if (diff > 0) {
-      adr_src = phase->transform(new AddPNode(base_src, adr_src, phase->MakeConX(diff)));
-      adr_dest = phase->transform(new AddPNode(base_dest, adr_dest, phase->MakeConX(diff)));
+      src.adr = phase->transform(new AddPNode(src.base, src.adr, phase->MakeConX(diff)));
+      dest.adr = phase->transform(new AddPNode(dest.base, dest.adr, phase->MakeConX(diff)));
     }
-    copy_type = elem;
-    value_type = ary_src->elem();
+    elem.type = bt;
+    elem.value_type = ary_src->elem();
   }
-  return true;
-}
 
-const TypePtr* ArrayCopyNode::get_address_type(PhaseGVN* phase, const TypePtr* atp, Node* n) {
-  if (atp == TypeOopPtr::BOTTOM) {
-    atp = phase->type(n)->isa_ptr();
-  }
-  // adjust atp to be the correct array element address type
-  return atp->add_offset(Type::OffsetBot);
+  // Compute the array element address type from the escape analysis type.
+  const TypePtr* src_atp = _src_type == TypeOopPtr::BOTTOM ? phase->type(src.base)->isa_ptr() : _src_type;
+  const TypePtr* dest_atp = _dest_type == TypeOopPtr::BOTTOM ? phase->type(dest.base)->isa_ptr() : _dest_type;
+  src.atp = src_atp->add_offset(Type::OffsetBot);
+  dest.atp = dest_atp->add_offset(Type::OffsetBot);
+  return true;
 }
 
 void ArrayCopyNode::array_copy_test_overlap(PhaseGVN *phase, bool can_reshape, bool disjoint_bases, int count, Node*& forward_ctl, Node*& backward_ctl) {
@@ -402,78 +410,273 @@ void ArrayCopyNode::array_copy_test_overlap(PhaseGVN *phase, bool can_reshape, b
   }
 }
 
+inline void ArrayCopyNode::copy_element(BarrierSetC2* bs, PhaseGVN* phase,
+                                        Node*& ctl, MergeMemNode* mm,
+                                        ArrayCopyAddr src, ArrayCopyAddr dest,
+                                        ArrayCopyType elem, int i) {
+  Node* s = src.adr;
+  Node* d = dest.adr;
+  if (i > 0) {
+    Node* off = phase->MakeConX(type2aelembytes(elem.type) * i);
+    s = phase->transform(new AddPNode(src.base, src.adr, off));
+    d = phase->transform(new AddPNode(dest.base, dest.adr, off));
+  }
+  Node* v = load(bs, phase, ctl, mm, s, src.atp, elem.value_type, elem.type);
+  store(bs, phase, ctl, mm, d, dest.atp, v, elem.value_type, elem.type);
+}
+
 Node* ArrayCopyNode::array_copy_forward(PhaseGVN *phase,
                                         bool can_reshape,
                                         Node*& forward_ctl,
                                         Node* mem,
-                                        const TypePtr* atp_src,
-                                        const TypePtr* atp_dest,
-                                        Node* adr_src,
-                                        Node* base_src,
-                                        Node* adr_dest,
-                                        Node* base_dest,
-                                        BasicType copy_type,
-                                        const Type* value_type,
-                                        int count) {
+                                        ArrayCopyAddr src,
+                                        ArrayCopyAddr dest,
+                                        ArrayCopyType elem) {
+  assert(elem.max_count == elem.min_count, "count");
+
   if (!forward_ctl->is_top()) {
     // copy forward
     MergeMemNode* mm = MergeMemNode::make(mem);
+    int count = elem.max_count;
 
     if (count > 0) {
       BarrierSetC2* bs = BarrierSet::barrier_set()->barrier_set_c2();
-      Node* v = load(bs, phase, forward_ctl, mm, adr_src, atp_src, value_type, copy_type);
-      store(bs, phase, forward_ctl, mm, adr_dest, atp_dest, v, value_type, copy_type);
-      for (int i = 1; i < count; i++) {
-        Node* off  = phase->MakeConX(type2aelembytes(copy_type) * i);
-        Node* next_src = phase->transform(new AddPNode(base_src,adr_src,off));
-        Node* next_dest = phase->transform(new AddPNode(base_dest,adr_dest,off));
-        v = load(bs, phase, forward_ctl, mm, next_src, atp_src, value_type, copy_type);
-        store(bs, phase, forward_ctl, mm, next_dest, atp_dest, v, value_type, copy_type);
+      for (int i = 0; i < count; i++) {
+        copy_element(bs, phase, forward_ctl, mm, src, dest, elem, i);
       }
     } else if (can_reshape) {
       PhaseIterGVN* igvn = phase->is_IterGVN();
-      igvn->_worklist.push(adr_src);
-      igvn->_worklist.push(adr_dest);
+      igvn->_worklist.push(src.adr);
+      igvn->_worklist.push(dest.adr);
     }
     return mm;
   }
   return phase->C->top();
 }
 
+// Copy chunk_size elements at the byte offset given by chunk_off (nullptr means
+// offset 0, i.e. use src.adr/dest.adr directly without an AddP).
+// Selects the widest available copy strategy: vector > scalar widening > element.
+// Updates mm and copy_ctl in-place.  Returns false if no viable strategy exists.
+bool ArrayCopyNode::copy_chunk(PhaseGVN* phase, BarrierSetC2* bs, Node*& copy_ctl, MergeMemNode* mm, ArrayCopyAddr src,
+                               ArrayCopyAddr dest, ArrayCopyType elem, int alias_idx, int chunk_size, Node* chunk_off) {
+  int elem_size = type2aelembytes(elem.type);
+  Node* s = chunk_off == nullptr ? src.adr  : phase->transform(new AddPNode(src.base,  src.adr,  chunk_off));
+  Node* d = chunk_off == nullptr ? dest.adr : phase->transform(new AddPNode(dest.base, dest.adr, chunk_off));
+
+  if (is_java_primitive(elem.type) && Matcher::vector_size_supported(elem.type, chunk_size)) {
+    Node* mem_in = mm->memory_at(alias_idx);
+    Node* vload  = phase->transform(LoadVectorNode::make(0, copy_ctl, mem_in, s, src.atp, chunk_size, elem.type));
+    Node* vstore = phase->transform(StoreVectorNode::make(0, copy_ctl, mem_in, d, dest.atp, vload, chunk_size));
+    mm->set_memory_at(alias_idx, vstore);
+  } else if (chunk_size > 1) {
+    int chunk_bytes = chunk_size * elem_size;
+    BasicType wide_bt;
+    const Type* wide_type;
+    switch (chunk_bytes) {
+      case 2: wide_bt = T_SHORT; wide_type = TypeInt::SHORT; break;
+      case 4: wide_bt = T_INT;   wide_type = TypeInt::INT;   break;
+      case 8: wide_bt = T_LONG;  wide_type = TypeLong::LONG; break;
+      default:
+        return false;
+    }
+    Node* mem_in = mm->memory_at(alias_idx);
+    Node* ld = LoadNode::make(*phase, copy_ctl, mem_in, s, src.atp, wide_type, wide_bt, MemNode::unordered,
+                              LoadNode::DependsOnlyOnTest, false, false, true);
+    ld = phase->transform(ld);
+    StoreNode* st = StoreNode::make(*phase, copy_ctl, mem_in, d, dest.atp, ld, wide_bt, MemNode::unordered);
+    st->set_mismatched_access();
+    mm->set_memory_at(alias_idx, phase->transform(st));
+  } else {
+    Node* v = load(bs, phase, copy_ctl, mm, s, src.atp, elem.value_type, elem.type);
+    store(bs, phase, copy_ctl, mm, d, dest.atp, v, elem.value_type, elem.type);
+  }
+  return true;
+}
+
+// Inline a forward arraycopy with non-constant but type-bounded length.
+//
+// Decomposes the conditional element count into power-of-2 chunks, testing
+// one bit at a time from high to low.  Each bit test forms a flat if-diamond,
+// giving ceil(log2(N)) branches instead of the N nested guards a linear
+// staircase would need.
+//
+// For bit b with chunk_size = (1 << b):
+//   if (remaining & chunk_size) {
+//     copy chunk_size elements at offset (remaining & higher_bits_mask)
+//   }
+//
+// The element offset for each chunk is computable directly from 'remaining'
+// using bitwise AND — no Phi nodes are needed for address computation.
+//
+// For example, with type [0, 8] and length 7 (binary 111):
+//   if (len & 4) copy elements 0-3           offset = 0
+//   if (len & 2) copy elements 4-5           offset = len & 4 = 4
+//   if (len & 1) copy element  6             offset = len & 6 = 6
+Node* ArrayCopyNode::array_copy_forward_variable(PhaseGVN *phase, bool can_reshape, Node*& ctl, Node* mem,
+                                                 ArrayCopyAddr src, ArrayCopyAddr dest, ArrayCopyType elem) {
+  assert(elem.max_count >= elem.min_count, "count");
+
+  MergeMemNode* mm = MergeMemNode::make(mem);
+  Node* length = in(ArrayCopyNode::Length);
+  int alias_idx = phase->C->get_alias_index(dest.atp);
+  BarrierSetC2* bs = BarrierSet::barrier_set()->barrier_set_c2();
+  int guarded_count = elem.max_count - elem.min_count;
+
+  // Masked vector path: single branchless masked load + store for the
+  // entire variable-length copy.  Requires hardware support for masked
+  // vector operations (e.g. AVX-512 on x86).
+  if (is_java_primitive(elem.type) && elem.max_count > 0) {
+    int lane_count = round_up_power_of_2(elem.max_count);
+    unsigned vec_size = lane_count * type2aelembytes(elem.type);
+    if (Matcher::match_rule_supported_vector(Op_VectorMaskGen,     lane_count, elem.type) &&
+        Matcher::match_rule_supported_vector(Op_LoadVectorMasked,  lane_count, elem.type) &&
+        Matcher::match_rule_supported_vector(Op_StoreVectorMasked, lane_count, elem.type)) {
+      if (phase->C->max_vector_size() < vec_size) {
+        phase->C->set_max_vector_size(vec_size);
+      }
+
+      const TypeVect* vt = TypeVect::make(elem.type, lane_count);
+      Node* len_long = phase->transform(new ConvI2LNode(length));
+      Node* mask = phase->transform(VectorMaskGenNode::make(len_long, elem.type, lane_count));
+
+      Node* mem_in = mm->memory_at(alias_idx);
+      Node* vload  = phase->transform(new LoadVectorMaskedNode(ctl, mem_in, src.adr, src.atp, vt, mask));
+      Node* vstore = phase->transform(new StoreVectorMaskedNode(ctl, mem_in, dest.adr, vload, dest.atp, mask));
+      mm->set_memory_at(alias_idx, vstore);
+      return mm;
+    }
+  }
+
+  int elem_size = type2aelembytes(elem.type);
+  int shift = exact_log2(elem_size);
+
+  // Phase 1: Copy min_count elements unconditionally.  Decompose into power-of-2
+  // chunks (high bit first) and use the widest available op per chunk.
+  intptr_t byte_offset = 0;
+  for (int b = (elem.min_count > 0 ? log2i(elem.min_count) : -1); b >= 0; b--) {
+    int chunk_size = 1 << b;
+    if (!(elem.min_count & chunk_size)) {
+      continue;
+    }
+    Node* chunk_off = (byte_offset == 0) ? nullptr : phase->MakeConX(byte_offset);
+    if (!copy_chunk(phase, bs, ctl, mm, src, dest, elem, alias_idx, chunk_size, chunk_off)) {
+      return nullptr;
+    }
+    byte_offset += (intptr_t)chunk_size * elem_size;
+  }
+
+  if (guarded_count <= 0) {
+    return mm;
+  }
+
+  // Phase 2: Binary staircase for the conditional region.
+  Node* remaining;
+  if (elem.min_count > 0) {
+    remaining = phase->transform(new SubINode(length, phase->intcon(elem.min_count)));
+  } else {
+    remaining = length;
+  }
+
+  int highest_bit = log2i(guarded_count);
+  intptr_t base_off = (intptr_t)elem.min_count * elem_size;
+
+  for (int b = highest_bit; b >= 0; b--) {
+    int chunk_size = 1 << b;
+
+    // Guard: if (remaining & chunk_size) != 0.
+    Node* cmp;
+    BoolTest::mask bt;
+    if (b == highest_bit) {
+      // chunk_size = 2^highest_bit, so remaining < 2*chunk_size (by definition of highest_bit).
+      // For any x in [0, 2*chunk_size): x & chunk_size != 0  iff  x >= chunk_size.
+      cmp = phase->transform(new CmpINode(remaining, phase->intcon(chunk_size)));
+      bt = BoolTest::ge;
+    } else {
+      Node* test = phase->transform(new AndINode(remaining, phase->intcon(chunk_size)));
+      cmp = phase->transform(new CmpINode(test, phase->intcon(0)));
+      bt = BoolTest::ne;
+    }
+    Node* bol  = phase->transform(new BoolNode(cmp, bt));
+    IfNode* iff = phase->transform(new IfNode(ctl, bol, PROB_FAIR, COUNT_UNKNOWN))->as_If();
+    Node* if_true  = phase->transform(new IfTrueNode(iff));
+    Node* if_false = phase->transform(new IfFalseNode(iff));
+
+    // Snapshot memory before the conditional stores.
+    Node* mem_before = mm->memory_at(alias_idx);
+
+    // Byte offset of this chunk's start: the element offset within the
+    // guarded region is (remaining & higher_bits_mask), contributed by all
+    // bits above 'b'.  Add min_count to get the absolute element index,
+    // then scale to bytes.
+    int offset_mask = ((1 << (highest_bit + 1)) - 1) & ~((1 << (b + 1)) - 1);
+
+    Node* runtime_byte_off = nullptr;
+    if (offset_mask != 0) {
+      Node* runtime_elem_off = phase->transform(new AndINode(remaining, phase->intcon(offset_mask)));
+      Node* runtime_elem_off_x = Compile::conv_I2X_index(phase, runtime_elem_off, TypeInt::POS);
+      runtime_byte_off = (shift > 0)
+        ? phase->transform(new LShiftXNode(runtime_elem_off_x, phase->intcon(shift)))
+        : runtime_elem_off_x;
+    }
+
+    // Byte offset to the start of this chunk.
+    Node* chunk_off;
+    if (runtime_byte_off == nullptr && base_off == 0) {
+      chunk_off = nullptr;
+    } else if (runtime_byte_off == nullptr) {
+      chunk_off = phase->MakeConX(base_off);
+    } else if (base_off == 0) {
+      chunk_off = runtime_byte_off;
+    } else {
+      chunk_off = phase->transform(new AddXNode(runtime_byte_off, phase->MakeConX(base_off)));
+    }
+
+    Node* copy_ctl = if_true;
+    if (!copy_chunk(phase, bs, copy_ctl, mm, src, dest, elem, alias_idx, chunk_size, chunk_off)) {
+      return nullptr;
+    }
+
+    // Merge the diamond.
+    RegionNode* merge = new RegionNode(3);
+    merge->init_req(1, copy_ctl);
+    merge->init_req(2, if_false);
+    merge = phase->transform(merge)->as_Region();
+
+    PhiNode* mem_phi = new PhiNode(merge, Type::MEMORY, phase->C->get_adr_type(alias_idx));
+    mem_phi->init_req(1, mm->memory_at(alias_idx));
+    mem_phi->init_req(2, mem_before);
+    mm->set_memory_at(alias_idx, phase->transform(mem_phi));
+
+    ctl = merge;
+  }
+
+  return mm;
+}
+
 Node* ArrayCopyNode::array_copy_backward(PhaseGVN *phase,
                                          bool can_reshape,
                                          Node*& backward_ctl,
                                          Node* mem,
-                                         const TypePtr* atp_src,
-                                         const TypePtr* atp_dest,
-                                         Node* adr_src,
-                                         Node* base_src,
-                                         Node* adr_dest,
-                                         Node* base_dest,
-                                         BasicType copy_type,
-                                         const Type* value_type,
-                                         int count) {
+                                         ArrayCopyAddr src,
+                                         ArrayCopyAddr dest,
+                                         ArrayCopyType elem) {
   if (!backward_ctl->is_top()) {
     // copy backward
     MergeMemNode* mm = MergeMemNode::make(mem);
+    int count = elem.max_count;
 
     BarrierSetC2* bs = BarrierSet::barrier_set()->barrier_set_c2();
-    assert(copy_type != T_OBJECT || !bs->array_copy_requires_gc_barriers(false, T_OBJECT, false, false, BarrierSetC2::Optimization), "only tightly coupled allocations for object arrays");
+    assert(elem.type != T_OBJECT || !bs->array_copy_requires_gc_barriers(false, T_OBJECT, false, false, BarrierSetC2::Optimization), "only tightly coupled allocations for object arrays");
 
     if (count > 0) {
-      for (int i = count-1; i >= 1; i--) {
-        Node* off  = phase->MakeConX(type2aelembytes(copy_type) * i);
-        Node* next_src = phase->transform(new AddPNode(base_src,adr_src,off));
-        Node* next_dest = phase->transform(new AddPNode(base_dest,adr_dest,off));
-        Node* v = load(bs, phase, backward_ctl, mm, next_src, atp_src, value_type, copy_type);
-        store(bs, phase, backward_ctl, mm, next_dest, atp_dest, v, value_type, copy_type);
+      for (int i = count-1; i >= 0; i--) {
+        copy_element(bs, phase, backward_ctl, mm, src, dest, elem, i);
       }
-      Node* v = load(bs, phase, backward_ctl, mm, adr_src, atp_src, value_type, copy_type);
-      store(bs, phase, backward_ctl, mm, adr_dest, atp_dest, v, value_type, copy_type);
     } else if (can_reshape) {
       PhaseIterGVN* igvn = phase->is_IterGVN();
-      igvn->_worklist.push(adr_src);
-      igvn->_worklist.push(adr_dest);
+      igvn->_worklist.push(src.adr);
+      igvn->_worklist.push(dest.adr);
     }
     return phase->transform(mm);
   }
@@ -576,7 +779,73 @@ Node *ArrayCopyNode::Ideal(PhaseGVN *phase, bool can_reshape) {
   int count = get_count(phase);
 
   if (count < 0 || count > ArrayCopyLoadStoreMaxElem) {
-    return nullptr;
+    if (!OptSmallArrayCopy) {
+      return nullptr;
+    }
+    const TypeInt* length_type = phase->type(in(ArrayCopyNode::Length))->isa_int();
+    if (length_type == nullptr || length_type->_lo < 0 ||
+        length_type->_hi <= 0 || length_type->_hi > ArrayCopyLoadStoreMaxElem) {
+      return nullptr;
+    }
+
+    ArrayCopyAddr ac_src = {};
+    ArrayCopyAddr ac_dest = {};
+    ArrayCopyType ac_elem = { T_ILLEGAL, nullptr, length_type->_lo, length_type->_hi };
+    bool disjoint_bases = false;
+
+    if (!prepare_array_copy(phase, can_reshape, ac_src, ac_dest, ac_elem, disjoint_bases)) {
+      assert(ac_src.adr == nullptr, "no node can be left behind");
+      assert(ac_dest.adr == nullptr, "no node can be left behind");
+      return nullptr;
+    }
+
+    // Only handle disjoint copies (no overlap/backward needed)
+    if (!disjoint_bases) {
+      return nullptr;
+    }
+    Node* in_mem = in(TypeFunc::Memory);
+
+    if (can_reshape) {
+      assert(!phase->is_IterGVN()->delay_transform(), "cannot delay transforms");
+      phase->is_IterGVN()->set_delay_transform(true);
+    }
+
+    Node* ctl = in(TypeFunc::Control);
+    Node* mem = array_copy_forward_variable(phase, can_reshape, ctl, in_mem, ac_src, ac_dest, ac_elem);
+
+    if (can_reshape) {
+      assert(phase->is_IterGVN()->delay_transform(), "should be delaying transforms");
+      phase->is_IterGVN()->set_delay_transform(false);
+    }
+
+    if (mem == nullptr) {
+      return nullptr;
+    }
+
+    if (!finish_transform(phase, can_reshape, ctl, mem)) {
+      if (can_reshape) {
+        phase->is_IterGVN()->_worklist.push(mem);
+      }
+      return nullptr;
+    }
+
+#ifndef PRODUCT
+    {
+      int bt = (int)ac_elem.type;
+      int mc = ac_elem.max_count;
+      if (bt >= 0 && bt <= T_LONG && mc >= 1 && mc <= ArrayCopyLoadStoreMaxElem) {
+        _opt_small_counts[bt][mc]++;
+      }
+      if (PrintOptoStatistics) {
+        tty->print("OptSmallArrayCopy variable-length expanded: %-6s [%d..%d]  ",
+                   type2name(ac_elem.type), ac_elem.min_count, ac_elem.max_count);
+        phase->C->method()->print_name(tty);
+        tty->cr();
+      }
+    }
+#endif
+
+    return mem;
   }
 
   Node* mem = try_clone_instance(phase, can_reshape, count);
@@ -584,26 +853,16 @@ Node *ArrayCopyNode::Ideal(PhaseGVN *phase, bool can_reshape) {
     return (mem == NodeSentinel) ? nullptr : mem;
   }
 
-  Node* adr_src = nullptr;
-  Node* base_src = nullptr;
-  Node* adr_dest = nullptr;
-  Node* base_dest = nullptr;
-  BasicType copy_type = T_ILLEGAL;
-  const Type* value_type = nullptr;
+  ArrayCopyAddr ac_src = {};
+  ArrayCopyAddr ac_dest = {};
+  ArrayCopyType ac_elem = { T_ILLEGAL, nullptr, count, count };
   bool disjoint_bases = false;
 
-  if (!prepare_array_copy(phase, can_reshape,
-                          adr_src, base_src, adr_dest, base_dest,
-                          copy_type, value_type, disjoint_bases)) {
-    assert(adr_src == nullptr, "no node can be left behind");
-    assert(adr_dest == nullptr, "no node can be left behind");
+  if (!prepare_array_copy(phase, can_reshape, ac_src, ac_dest, ac_elem, disjoint_bases)) {
+    assert(ac_src.adr == nullptr, "no node can be left behind");
+    assert(ac_dest.adr == nullptr, "no node can be left behind");
     return nullptr;
   }
-
-  Node* src = in(ArrayCopyNode::Src);
-  Node* dest = in(ArrayCopyNode::Dest);
-  const TypePtr* atp_src = get_address_type(phase, _src_type, src);
-  const TypePtr* atp_dest = get_address_type(phase, _dest_type, dest);
   Node* in_mem = in(TypeFunc::Memory);
 
   if (can_reshape) {
@@ -616,16 +875,10 @@ Node *ArrayCopyNode::Ideal(PhaseGVN *phase, bool can_reshape) {
   array_copy_test_overlap(phase, can_reshape, disjoint_bases, count, forward_ctl, backward_ctl);
 
   Node* forward_mem = array_copy_forward(phase, can_reshape, forward_ctl,
-                                         in_mem,
-                                         atp_src, atp_dest,
-                                         adr_src, base_src, adr_dest, base_dest,
-                                         copy_type, value_type, count);
+                                         in_mem, ac_src, ac_dest, ac_elem);
 
   Node* backward_mem = array_copy_backward(phase, can_reshape, backward_ctl,
-                                           in_mem,
-                                           atp_src, atp_dest,
-                                           adr_src, base_src, adr_dest, base_dest,
-                                           copy_type, value_type, count);
+                                           in_mem, ac_src, ac_dest, ac_elem);
 
   Node* ctl = nullptr;
   if (!forward_ctl->is_top() && !backward_ctl->is_top()) {
@@ -776,6 +1029,38 @@ bool ArrayCopyNode::modifies(intptr_t offset_lo, intptr_t offset_hi, PhaseValues
   }
   return false;
 }
+
+#ifndef PRODUCT
+// Print the compile-time OptSmallArrayCopy histogram.  Called at JVM exit
+// from Compile::print_statistics().
+void ArrayCopyNode::print_opt_small_statistics() {
+  bool any = false;
+  for (int t = T_BOOLEAN; t <= T_LONG && !any; t++) {
+    for (int mc = 1; mc <= ArrayCopyLoadStoreMaxElem && !any; mc++) {
+      any = (_opt_small_counts[t][mc] > 0);
+    }
+  }
+
+  tty->print_cr("OptSmallArrayCopy variable-length array compiled (type, count, sites):");
+  if (!any) {
+    tty->print_cr("  (none)");
+    return;
+  }
+  const BasicType types[] = { T_BYTE, T_SHORT, T_INT, T_LONG };
+  for (int ti = 0; ti < 4; ti++) {
+    BasicType bt = types[ti];
+    int row_total = 0;
+    for (int mc = 1; mc <= ArrayCopyLoadStoreMaxElem; mc++) row_total += _opt_small_counts[(int)bt][mc];
+    if (row_total == 0) continue;
+    tty->print("  %-6s (total=%d):", type2name(bt), row_total);
+    for (int mc = 1; mc <= ArrayCopyLoadStoreMaxElem; mc++) {
+      int cnt = _opt_small_counts[(int)bt][mc];
+      if (cnt > 0) tty->print("  [..%d]=%d", mc, cnt);
+    }
+    tty->cr();
+  }
+}
+#endif
 
 // As an optimization, choose the optimal vector size for bounded copy length
 int ArrayCopyNode::get_partial_inline_vector_lane_count(BasicType type, jlong max_len) {
