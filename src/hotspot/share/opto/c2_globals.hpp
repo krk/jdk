@@ -583,6 +583,9 @@
   develop(bool, VerifyConnectionGraph , true,                               \
           "Verify Connection Graph construction in Escape Analysis")        \
                                                                             \
+  product(bool, RecoverInitStores, true, DIAGNOSTIC,                        \
+          "Recover uncaptured initializing stores in escape analysis")      \
+                                                                            \
   product(bool, OptimizeStringConcat, true,                                 \
           "Optimize the construction of Strings by StringBuilder")          \
                                                                             \

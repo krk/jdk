@@ -2834,6 +2834,7 @@ int ConnectionGraph::find_init_values_null(JavaObjectNode* pta, PhaseValues* pha
     return 0;
   }
   InitializeNode* ini = alloc->as_Allocate()->initialization();
+  Node* init_ctrl = (ini != nullptr) ? ini->proj_out_or_null(TypeFunc::Control) : nullptr;
   bool visited_bottom_offset = false;
   GrowableArray<int> offsets_worklist;
   int new_edges = 0;
@@ -2926,13 +2927,72 @@ int ConnectionGraph::find_init_values_null(JavaObjectNode* pta, PhaseValues* pha
             }
 #endif
           } else {
-            // There could be initializing stores which follow allocation.
-            // For example, a volatile field store is not collected
-            // by Initialize node.
-            //
-            // Need to check for dependent loads to separate such stores from
-            // stores which follow loads. For now, add initial value null so
-            // that compare pointers optimization works correctly.
+            // There could be initializing stores which follow allocation
+            // but were not captured by InitializeNode (e.g., when
+            // ReduceFieldZeroing is off, or the store is behind a null
+            // check from Objects.requireNonNull). Walk AddP uses to find
+            // a store dominated by Initialize's control projection.
+            if (RecoverInitStores && init_ctrl != nullptr) {
+              Node* addp = field->ideal_node();
+              for (DUIterator_Fast jmax, j = addp->fast_outs(jmax); j < jmax; j++) {
+                Node* use = addp->fast_out(j);
+                if (use->is_Store() &&
+                    use->as_Store()->value_basic_type() == ft) {
+                  // Walk from the store's control up toward init_ctrl. We step through
+                  // three kinds of single-entry control nodes that preserve dominance:
+                  // IfProj, CatchProj, MemBar. If we reach init_ctrl, the store is
+                  // unconditional on all non-deoptimizing paths from the allocation.
+                  Node* ctrl = use->in(MemNode::Control);
+                  bool dominated = false;
+                  NOT_PRODUCT(int ifproj_steps = 0; int catchproj_steps = 0; int membar_steps = 0;)
+                  for (int k = 0; k < 10 && ctrl != nullptr; k++) {
+                    if (ctrl == init_ctrl) {
+                      dominated = true;
+                      break;
+                    }
+                    NOT_PRODUCT(if (PrintEliminateAllocations) {
+                      tty->print("EA:   walk step %d: ", k);
+                      ctrl->dump();
+                    })
+                    // Uncommon-trap guard: IfProj -> If -> If.ctrl
+                    if (ctrl->is_IfProj() &&
+                        ctrl->as_IfProj()->is_uncommon_trap_if_pattern() != nullptr) {
+                      ctrl = ctrl->in(0)->in(0);
+                      NOT_PRODUCT(ifproj_steps++;)
+                    // Normal-return CatchProj: CatchProj -> Catch -> CtrlProj -> Call -> Call.ctrl
+                    } else if (ctrl->is_CatchProj() &&
+                               ctrl->as_CatchProj()->_con == CatchProjNode::fall_through_index) {
+                      Node* catch_node = ctrl->in(0);
+                      Node* call_ctrl  = (catch_node != nullptr && catch_node->is_Catch()) ?
+                                          catch_node->in(0) : nullptr;
+                      Node* call_node  = (call_ctrl != nullptr && call_ctrl->is_Proj()) ?
+                                          call_ctrl->in(0) : nullptr;
+                      if (call_node != nullptr && call_node->is_Call()) {
+                        ctrl = call_node->in(TypeFunc::Control);
+                        NOT_PRODUCT(catchproj_steps++;)
+                      } else {
+                        break;
+                      }
+                    // Memory barrier: Proj -> MemBar -> MemBar.ctrl
+                    } else if (ctrl->is_Proj() && ctrl->in(0) != nullptr && ctrl->in(0)->is_MemBar()) {
+                      ctrl = ctrl->in(0)->in(TypeFunc::Control);
+                      NOT_PRODUCT(membar_steps++;)
+                    } else {
+                      break;
+                    }
+                  }
+                  if (dominated) {
+                    NOT_PRODUCT(if (PrintEliminateAllocations) {
+                      tty->print("EA: found uncaptured init store for field offset %d (ifproj=%d catchproj=%d membar=%d): ",
+                                 offset, ifproj_steps, catchproj_steps, membar_steps);
+                      use->dump();
+                    })
+                    value = use->in(MemNode::ValueIn);
+                    break;
+                  }
+                }
+              }
+            }
           }
         }
         if (value == nullptr) {
@@ -2941,6 +3001,10 @@ int ConnectionGraph::find_init_values_null(JavaObjectNode* pta, PhaseValues* pha
             // New edge was added
             new_edges++;
             add_field_uses_to_worklist(field->as_Field());
+            NOT_PRODUCT(if (PrintEliminateAllocations) {
+              tty->print_cr("EA: adding null_obj for field offset %d of node %d",
+                             offset, alloc->_idx);
+            })
           }
         }
       }
