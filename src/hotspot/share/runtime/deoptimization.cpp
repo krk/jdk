@@ -1279,6 +1279,26 @@ bool Deoptimization::realloc_objects(JavaThread* thread, frame* fr, RegisterMap*
       obj = ak->allocate_instance(sv->field_size(), THREAD);
     }
 
+    if (sv->is_clone()) {
+      CloneObjectValue* cv = (CloneObjectValue*) sv;
+      StackValue* src_val = StackValue::create_stack_value(fr, reg_map, cv->source());
+      oop src_oop = src_val->get_obj()();
+      assert(src_oop != nullptr, "source of clone must be live");
+
+      InternalOOMEMark iom(THREAD);
+      Klass* src_k = src_oop->klass();
+      if (src_k->is_typeArray_klass()) {
+        int len = typeArrayOop(src_oop)->length();
+        obj = TypeArrayKlass::cast(src_k)->allocate_instance(len, THREAD);
+      } else if (src_k->is_objArray_klass()) {
+        int len = objArrayOop(src_oop)->length();
+        obj = ObjArrayKlass::cast(src_k)->allocate_instance(len, THREAD);
+      }
+      if (obj != nullptr) {
+        HeapAccess<>::clone(src_oop, obj, src_oop->size());
+      }
+    }
+
     if (obj == nullptr) {
       failures = true;
     }
@@ -1591,6 +1611,12 @@ void Deoptimization::reassign_fields(frame* fr, RegisterMap* reg_map, GrowableAr
 #endif // !PRODUCT
 
     if (obj.is_null()) {
+      continue;
+    }
+
+    // CloneObjectValue entries are fully populated during realloc via
+    // HeapAccess<>::clone(), so skip field reassignment.
+    if (sv->is_clone()) {
       continue;
     }
 

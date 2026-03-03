@@ -1072,6 +1072,16 @@ void CallJavaNode::copy_call_debug_info(PhaseIterGVN* phase, SafePointNode* sfpt
       }
       old_in = new_in;
     }
+    if (old_in != nullptr && old_in->is_SafePointScalarClone()) {
+      SafePointScalarCloneNode* old_scln = old_in->as_SafePointScalarClone();
+      bool new_node;
+      Node* new_in = old_scln->clone(sosn_map, new_node);
+      if (new_node) {
+        new_in->set_req(0, C->root());
+        new_in = phase->transform(new_in);
+      }
+      old_in = new_in;
+    }
     add_req(old_in);
   }
 
@@ -1692,6 +1702,57 @@ SafePointScalarMergeNode::clone(Dict* sosn_map, bool& new_node) const {
 #ifndef PRODUCT
 void SafePointScalarMergeNode::dump_spec(outputStream *st) const {
   st->print(" # merge_pointer_idx=%d, scalarized_objects=%d", _merge_pointer_idx, req()-1);
+}
+#endif
+
+//==============  SafePointScalarCloneNode  ==============
+
+SafePointScalarCloneNode::SafePointScalarCloneNode(const TypeOopPtr* tp, uint src_index, uint depth) :
+  TypeNode(tp, 1), // 1 control input -- required.  Get from root.
+  _src_index(src_index),
+  _depth(depth)
+{
+  init_class_id(Class_SafePointScalarClone);
+}
+
+// Do not allow value-numbering for SafePointScalarClone node.
+uint SafePointScalarCloneNode::hash() const { return NO_HASH; }
+bool SafePointScalarCloneNode::cmp( const Node &n ) const {
+  return (&n == this); // Always fail except on self
+}
+
+uint SafePointScalarCloneNode::ideal_reg() const {
+  return 0; // No matching to machine instruction
+}
+
+const RegMask &SafePointScalarCloneNode::in_RegMask(uint idx) const {
+  return *(Compile::current()->matcher()->idealreg2debugmask[in(idx)->ideal_reg()]);
+}
+
+const RegMask &SafePointScalarCloneNode::out_RegMask() const {
+  return RegMask::EMPTY;
+}
+
+uint SafePointScalarCloneNode::match_edge(uint idx) const {
+  return 0;
+}
+
+SafePointScalarCloneNode*
+SafePointScalarCloneNode::clone(Dict* sosn_map, bool& new_node) const {
+  void* cached = (*sosn_map)[(void*)this];
+  if (cached != nullptr) {
+    new_node = false;
+    return (SafePointScalarCloneNode*)cached;
+  }
+  new_node = true;
+  SafePointScalarCloneNode* res = (SafePointScalarCloneNode*)Node::clone();
+  sosn_map->Insert((void*)this, (void*)res);
+  return res;
+}
+
+#ifndef PRODUCT
+void SafePointScalarCloneNode::dump_spec(outputStream *st) const {
+  st->print(" # src@[%d]", _src_index);
 }
 #endif
 

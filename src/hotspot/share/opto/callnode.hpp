@@ -662,6 +662,39 @@ public:
 #endif
 };
 
+//------------------------------SafePointScalarCloneNode-----------------------
+// A SafePointScalarCloneNode represents a clone destination whose allocation
+// was eliminated by redundant-clone elimination.  During deoptimization the
+// runtime allocates a fresh array and copies from the source.
+class SafePointScalarCloneNode: public TypeNode {
+  uint _src_index;   // Relative index in SafePoint's scl area where the source oop is stored
+  uint _depth;       // JVM state depth
+
+  virtual uint hash() const;
+  virtual bool cmp(const Node &n) const;
+  uint src_index() const { return _src_index; }
+
+public:
+  SafePointScalarCloneNode(const TypeOopPtr* tp, uint src_index, uint depth);
+  virtual int Opcode() const;
+  virtual uint           ideal_reg() const;
+  virtual const RegMask &in_RegMask(uint) const;
+  virtual const RegMask &out_RegMask() const;
+  virtual uint           match_edge(uint idx) const;
+
+  uint src_index(JVMState* jvms) const {
+    assert(jvms != nullptr, "missed JVMS");
+    return jvms->of_depth(_depth)->scloff() + _src_index;
+  }
+
+  virtual uint size_of() const { return sizeof(*this); }
+  SafePointScalarCloneNode* clone(Dict* sosn_map, bool& new_node) const;
+
+#ifndef PRODUCT
+  virtual void dump_spec(outputStream *st) const;
+#endif
+};
+
 // Simple container for the outgoing projections of a call.  Useful
 // for serious surgery on calls.
 class CallProjections : public StackObj {

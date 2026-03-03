@@ -53,6 +53,7 @@ class ScopeValue: public AnyObj {
   virtual bool is_object() const { return false; }
   virtual bool is_object_merge() const { return false; }
   virtual bool is_auto_box() const { return false; }
+  virtual bool is_clone() const { return false; }
   virtual bool is_marker() const { return false; }
   virtual bool is_constant_int() const { return false; }
   virtual bool is_constant_double() const { return false; }
@@ -247,6 +248,24 @@ public:
   AutoBoxObjectValue(int id) : ObjectValue(id), _cached(false) { }
 };
 
+// A CloneObjectValue describes a clone destination whose allocation was
+// eliminated.  During deoptimization the runtime allocates a fresh array
+// and copies from the source oop.
+class CloneObjectValue : public ObjectValue {
+  ScopeValue* _source;   // LocationValue for where the source oop lives in the frame
+public:
+  CloneObjectValue(int id, ScopeValue* klass, ScopeValue* source)
+     : ObjectValue(id, klass), _source(source) {}
+  CloneObjectValue(int id) : ObjectValue(id), _source(nullptr) {}
+
+  bool        is_clone() const  { return true; }
+  ScopeValue* source() const    { return _source; }
+
+  // Serialization of debugging information
+  void read_object(DebugInfoReadStream* stream);
+  void write_on(DebugInfoWriteStream* stream);
+};
+
 
 // A ConstantIntValue describes a constant int; i.e., the corresponding logical entity
 // is either a source constant or its computation has been constant-folded.
@@ -389,6 +408,7 @@ class DebugInfoReadStream : public CompressedReadStream {
   }
   ScopeValue* read_object_value(bool is_auto_box);
   ScopeValue* read_object_merge_value();
+  ScopeValue* read_clone_object_value();
   ScopeValue* get_cached_object();
   // BCI encoding is mostly unsigned, but -1 is a distinguished value
   int read_bci() { return read_int() + InvocationEntryBci; }

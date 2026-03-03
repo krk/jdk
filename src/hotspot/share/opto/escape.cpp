@@ -311,6 +311,21 @@ bool ConnectionGraph::compute_escape() {
     Node* n = ptn->ideal_node();
     if (n->is_Allocate()) {
       n->as_Allocate()->_is_non_escaping = noescape;
+      // When an array allocation is marked non-escaping, any clone
+      // ArrayCopy using it as source may now be eliminable by
+      // EliminateRedundantClone.  Record those for IGVN so that
+      // ArrayCopyNode::Ideal() gets a chance to optimize them.
+      if (EliminateRedundantClone && noescape && n->is_AllocateArray()) {
+        Node* cast = n->as_Allocate()->result_cast();
+        if (cast != nullptr) {
+          for (DUIterator_Fast imax, i = cast->fast_outs(imax); i < imax; i++) {
+            Node* use = cast->fast_out(i);
+            if (use->is_ArrayCopy() && use->as_ArrayCopy()->is_clone_array()) {
+              _igvn->record_for_igvn(use);
+            }
+          }
+        }
+      }
     }
     if (noescape && ptn->scalar_replaceable()) {
       adjust_scalar_replaceable_state(ptn, reducible_merges);
@@ -2294,12 +2309,21 @@ void ConnectionGraph::process_call_arguments(CallNode *call) {
             continue;
           }
           PointsToNode::EscapeState es = PointsToNode::ArgEscape;
-          if (call->is_ArrayCopy()) {
-            ArrayCopyNode* ac = call->as_ArrayCopy();
-            if (ac->is_clonebasic() ||
-                ac->is_arraycopy_validated() ||
-                ac->is_copyof_validated() ||
-                ac->is_copyofrange_validated()) {
+          if (is_arraycopy) {
+            if (call->is_ArrayCopy()) {
+              ArrayCopyNode* ac = call->as_ArrayCopy();
+              if (ac->is_clonebasic() ||
+                  ac->is_arraycopy_validated() ||
+                  ac->is_copyof_validated() ||
+                  ac->is_copyofrange_validated()) {
+                es = PointsToNode::NoEscape;
+              }
+            } else {
+              // CallLeaf stubs whose name contains "arraycopy"
+              // (e.g. unsafe_arraycopy from Unsafe.copyMemory, or
+              // jbyte_arraycopy from PhaseStringOpts::copy_string)
+              // only read/write array content through raw addresses
+              // — they do not store the array pointer itself.
               es = PointsToNode::NoEscape;
             }
           }

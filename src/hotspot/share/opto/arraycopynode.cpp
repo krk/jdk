@@ -28,6 +28,7 @@
 #include "gc/shared/gc_globals.hpp"
 #include "opto/arraycopynode.hpp"
 #include "opto/graphKit.hpp"
+#include "opto/rootnode.hpp"
 #include "utilities/powerOfTwo.hpp"
 
 const TypeFunc* ArrayCopyNode::_arraycopy_type_Type = nullptr;
@@ -536,8 +537,232 @@ bool ArrayCopyNode::finish_transform(PhaseGVN *phase, bool can_reshape,
 }
 
 
+// Eliminate a clone of a freshly-allocated non-escaping array.
+//
+// Pattern:
+//   A = AllocateArray(T[], len)          // source (non-escaping)
+//   fill: arraycopy(external -> A) or stores to A
+//   B = AllocateArray(T[], A.length)     // clone destination (tightly coupled)
+//   clone: ArrayCopy(CloneArray, src=A, dst=B)
+//   ... uses of B ...                    // A is dead after clone
+//
+// Transform: replace all uses of B with A, remove the clone.
+// After this, B's allocation becomes dead and is cleaned up by
+// the existing allocation elimination pass.
+//
+// This is NOT scalar replacement: it works for any array length
+// (including non-constant) because we simply reuse the source
+// allocation instead of breaking it into scalars.
+//
+Node* ArrayCopyNode::try_eliminate_redundant_clone(PhaseGVN* phase) {
+  assert(is_clone_array(), "only for array clones");
+
+  Node* src = in(ArrayCopyNode::Src);
+  Node* dst = in(ArrayCopyNode::Dest);
+
+  // Source must be a fresh array allocation.
+  if (src == nullptr || !src->is_CheckCastPP()) { NOT_PRODUCT(if (PrintEliminateAllocations) tty->print_cr("EliminateRedundantClone: bail - src not CheckCastPP")); return nullptr; }
+  AllocateArrayNode* src_alloc = nullptr;
+  {
+    AllocateNode* a = AllocateNode::Ideal_allocation(src);
+    if (a == nullptr || !a->is_AllocateArray()) { NOT_PRODUCT(if (PrintEliminateAllocations) tty->print_cr("EliminateRedundantClone: bail - src not AllocateArray")); return nullptr; }
+    src_alloc = a->as_AllocateArray();
+  }
+
+  // Source allocation must be marked non-escaping by EA.
+  if (!src_alloc->_is_non_escaping) { NOT_PRODUCT(if (PrintEliminateAllocations) tty->print_cr("EliminateRedundantClone: bail - src escaping")); return nullptr; }
+
+  // If the source is scalar-replaceable, PhaseMacroExpand will handle both
+  // allocations via scalar replacement.  Our optimization would conflict.
+  if (src_alloc->_is_scalar_replaceable) { NOT_PRODUCT(if (PrintEliminateAllocations) tty->print_cr("EliminateRedundantClone: bail - src scalar replaceable")); return nullptr; }
+
+  // Destination must also be a fresh allocation (tightly coupled with clone).
+  if (dst == nullptr || !dst->is_CheckCastPP()) { NOT_PRODUCT(if (PrintEliminateAllocations) tty->print_cr("EliminateRedundantClone: bail - dst not CheckCastPP")); return nullptr; }
+  if (AllocateNode::Ideal_allocation(dst) == nullptr) { NOT_PRODUCT(if (PrintEliminateAllocations) tty->print_cr("EliminateRedundantClone: bail - dst not Allocate")); return nullptr; }
+
+  // Already transformed (src == dst means we already replaced dst with src).
+  if (src == dst) return nullptr;
+
+  // Verify that the source array has no uses that would be
+  // invalidated by replacing the clone destination with the source.
+  //
+  // Allowed uses of src (A):
+  //   - This clone ArrayCopyNode (as Src input)
+  //   - An ArrayCopyNode where A is the Dest (the "fill")
+  //   - SafePoints with debug-only references to A
+  //   - AddP nodes whose users are all stores (filling the array)
+  //   - MemBarStoreStore / MemBarCPUOrder (from init)
+  //
+  // Disallowed: loads from A after the clone, A passed as a non-debug
+  // call argument, A returned, A in a Phi, etc.
+  for (DUIterator_Fast imax, i = src->fast_outs(imax); i < imax; i++) {
+    Node* use = src->fast_out(i);
+
+    if (use == this) continue;  // this clone itself
+
+    if (use->is_ArrayCopy()) {
+      // A as Dest of another arraycopy (the fill) is fine.
+      // A as Src of a different arraycopy means A's data is needed
+      // elsewhere — we can't safely replace B with A in that case.
+      if (use->in(ArrayCopyNode::Dest) == src) continue;  // fill
+      NOT_PRODUCT(if (PrintEliminateAllocations) { tty->print("EliminateRedundantClone: bail - src used as ArrayCopy src: "); use->dump(); })
+      return nullptr;
+    }
+
+    if (use->is_SafePoint()) {
+      SafePointNode* sfpt = use->as_SafePoint();
+      if (sfpt->is_Call() && sfpt->as_Call()->has_non_debug_use(src)) {
+        NOT_PRODUCT(if (PrintEliminateAllocations) { tty->print("EliminateRedundantClone: bail - non-debug call arg: "); use->dump(); })
+        return nullptr;  // A is a non-debug call argument
+      }
+      continue;  // debug info only
+    }
+
+    if (use->is_AddP()) {
+      // AddP computes an address into A.  Only stores (fills) and
+      // arraycopy stubs writing to A are allowed — no loads.
+      for (DUIterator_Fast kmax, k = use->fast_outs(kmax); k < kmax; k++) {
+        Node* addr_use = use->fast_out(k);
+        if (addr_use->is_Store() || addr_use->is_ArrayCopy()) {
+          // Verify this write is pre-clone: its control must dominate
+          // the clone so the write happens before the clone in program
+          // order.  Post-clone writes would become visible after
+          // replacing B with A, violating clone semantics.
+          if (!MemNode::all_controls_dominate(addr_use, this)) {
+            NOT_PRODUCT(if (PrintEliminateAllocations) { tty->print("EliminateRedundantClone: bail - post-clone write: "); addr_use->dump(); })
+            return nullptr;
+          }
+          continue;
+        }
+        if (addr_use->is_CallLeaf() &&
+            addr_use->as_CallLeaf()->is_call_to_arraycopystub()) {
+          // CallLeaf arraycopy stubs (e.g., unsafe_arraycopy from
+          // Unsafe.copyMemory) may be on conditional paths — the
+          // stub is guarded by a length > 0 check, creating a
+          // control diamond that merges before the clone.  We skip
+          // the domination check here: since A is non-escaping and
+          // all uses are validated, any such write is necessarily
+          // pre-clone (it feeds into the clone's input memory).
+          continue;
+        }
+        if (addr_use->Opcode() == Op_CastP2X) continue;  // card mark
+        // A load or anything else — bail.
+        NOT_PRODUCT(if (PrintEliminateAllocations) { tty->print("EliminateRedundantClone: bail - AddP has non-store use: "); addr_use->dump(); })
+        return nullptr;
+      }
+      continue;
+    }
+
+    if (use->Opcode() == Op_MemBarStoreStore ||
+        use->Opcode() == Op_MemBarCPUOrder) {
+      continue;
+    }
+
+    NOT_PRODUCT(if (PrintEliminateAllocations) { tty->print("EliminateRedundantClone: bail - unrecognized use: "); use->dump(); })
+    return nullptr;  // unrecognized use
+  }
+
+  // Verify output memory chain pattern: ArrayCopy -> ProjMem -> MergeMem -> MemBar.
+  // This is the same pattern that finish_transform checks for clonebasic.
+  Node* out_mem = proj_out(TypeFunc::Memory);
+  if (out_mem == nullptr) { NOT_PRODUCT(if (PrintEliminateAllocations) tty->print_cr("EliminateRedundantClone: bail - no out_mem")); return nullptr; }
+  if (out_mem->outcnt() != 1 || !out_mem->raw_out(0)->is_MergeMem()) { NOT_PRODUCT(if (PrintEliminateAllocations) tty->print_cr("EliminateRedundantClone: bail - out_mem pattern mismatch")); return nullptr; }
+  Node* old_mm = out_mem->raw_out(0);
+  if (old_mm->outcnt() != 1 || !old_mm->raw_out(0)->is_MemBar()) { NOT_PRODUCT(if (PrintEliminateAllocations) tty->print_cr("EliminateRedundantClone: bail - MergeMem->MemBar mismatch")); return nullptr; }
+
+  Node* out_ctl = proj_out(TypeFunc::Control);
+  if (out_ctl == nullptr) return nullptr;
+
+  // === All checks passed — perform the transformation. ===
+  PhaseIterGVN* igvn = phase->is_IterGVN();
+
+  Node* in_mem = in(TypeFunc::Memory);
+  Node* in_ctl = in(TypeFunc::Control);
+
+  NOT_PRODUCT(if (PrintEliminateAllocations) {
+    tty->print("EliminateRedundantClone: replacing clone dst with src  ");
+    this->dump();
+  })
+
+  // 1. Handle SafePoint debug info — replace dst with SafePointScalarCloneNode.
+  //    This ensures deoptimization allocates a fresh copy instead of aliasing
+  //    original and clone to the same object (which violates clone() != original).
+  {
+    // Collect SafePoints that reference dst in debug info.
+    // Must collect first because replace_edges_in_range invalidates DU iterators.
+    GrowableArray<SafePointNode*> sfpts;
+    for (DUIterator_Fast imax, i = dst->fast_outs(imax); i < imax; i++) {
+      Node* use = dst->fast_out(i);
+      if (use->is_SafePoint()) {
+        SafePointNode* sfpt = use->as_SafePoint();
+        JVMState* jvms = sfpt->jvms();
+        if (jvms != nullptr) {
+          for (uint j = jvms->debug_start(); j < jvms->debug_end(); j++) {
+            if (sfpt->in(j) == dst) {
+              sfpts.append_if_missing(sfpt);
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    // For each SafePoint: replace dst in debug info with SafePointScalarCloneNode.
+    const TypeOopPtr* dst_type = igvn->type(dst)->is_oopptr();
+    for (int k = 0; k < sfpts.length(); k++) {
+      SafePointNode* sfpt = sfpts.at(k);
+      JVMState* jvms = sfpt->jvms();
+
+      // Add src to SafePoint's scalar area (keeps src alive at this SafePoint).
+      uint src_ind = sfpt->req() - jvms->scloff();
+      sfpt->add_req(src);
+      jvms->set_endoff(sfpt->req());
+
+      // Create SafePointScalarCloneNode.
+      SafePointScalarCloneNode* sclone = new SafePointScalarCloneNode(
+          dst_type, src_ind, jvms->depth());
+      sclone->init_req(0, phase->C->root());
+      igvn->register_new_node_with_optimizer(sclone);
+
+      // Replace dst with sclone in debug range only.
+      sfpt->replace_edges_in_range(dst, sclone,
+          jvms->debug_start(), jvms->debug_end(), igvn);
+      igvn->_worklist.push(sfpt);
+    }
+  }
+
+  // 2. Replace remaining (non-debug) uses of dst with src.
+  igvn->replace_node(dst, src);
+
+  // 3. Create a new MergeMemNode that passes through the input memory.
+  //    This satisfies Ideal()'s return-value contract: the returned node
+  //    must have _idx >= this->_idx (or be top).  IGVN will subsume 'this'
+  //    with this MergeMemNode, then MergeMemNode::Identity will simplify
+  //    it down to in_mem.
+  MergeMemNode* mem = MergeMemNode::make(in_mem);
+  igvn->register_new_node_with_optimizer(mem);
+
+  // 4. Route the clone's output memory through our passthrough node.
+  //    Replace the old MergeMem (between ProjMem and MemBar) with ours.
+  igvn->replace_node(old_mm, mem);
+
+  // 5. Route the clone's output control to the input control.
+  igvn->replace_node(out_ctl, in_ctl);
+
+  // 6. Remove from macro node list (no longer needs macro expansion).
+  phase->C->remove_macro_node(this);
+
+  return mem;
+}
+
 Node *ArrayCopyNode::Ideal(PhaseGVN *phase, bool can_reshape) {
   if (remove_dead_region(phase, can_reshape))  return this;
+  if (can_reshape && is_clone_array() && EliminateRedundantClone) {
+    Node* result = try_eliminate_redundant_clone(phase);
+    if (result != nullptr) {
+      return result;
+    }
+  }
 
   if (StressArrayCopyMacroNode && !can_reshape) {
     phase->record_for_igvn(this);

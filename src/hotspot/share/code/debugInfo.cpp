@@ -107,7 +107,7 @@ enum { LOCATION_CODE = 0, CONSTANT_INT_CODE = 1,  CONSTANT_OOP_CODE = 2,
                           CONSTANT_LONG_CODE = 3, CONSTANT_DOUBLE_CODE = 4,
                           OBJECT_CODE = 5,        OBJECT_ID_CODE = 6,
                           AUTO_BOX_OBJECT_CODE = 7, MARKER_CODE = 8,
-                          OBJECT_MERGE_CODE = 9 };
+                          OBJECT_MERGE_CODE = 9,  CLONE_OBJECT_CODE = 10 };
 
 ScopeValue* ScopeValue::read_from(DebugInfoReadStream* stream) {
   ScopeValue* result = nullptr;
@@ -120,6 +120,7 @@ ScopeValue* ScopeValue::read_from(DebugInfoReadStream* stream) {
    case OBJECT_CODE:          result = stream->read_object_value(false /*is_auto_box*/); break;
    case AUTO_BOX_OBJECT_CODE: result = stream->read_object_value(true /*is_auto_box*/);  break;
    case OBJECT_MERGE_CODE:    result = stream->read_object_merge_value();                break;
+   case CLONE_OBJECT_CODE:    result = stream->read_clone_object_value();               break;
    case OBJECT_ID_CODE:       result = stream->get_cached_object();                      break;
    case MARKER_CODE:          result = new MarkerValue();                                break;
    default: ShouldNotReachHere();
@@ -292,6 +293,43 @@ void ObjectMergeValue::write_on(DebugInfoWriteStream* stream) {
     for (int i = 0; i < ncandidates; i++) {
       _possible_objects.at(i)->as_ObjectValue()->write_on(stream);
     }
+  }
+}
+
+// CloneObjectValue
+
+ScopeValue* DebugInfoReadStream::read_clone_object_value() {
+  int id = read_int();
+#ifdef ASSERT
+  assert(_obj_pool != nullptr, "object pool does not exist");
+  for (int i = _obj_pool->length() - 1; i >= 0; i--) {
+    assert(_obj_pool->at(i)->as_ObjectValue()->id() != id, "should not be read twice");
+  }
+#endif
+  CloneObjectValue* result = new CloneObjectValue(id);
+  _obj_pool->push(result);
+  result->read_object(this);
+  return result;
+}
+
+void CloneObjectValue::read_object(DebugInfoReadStream* stream) {
+  _is_root = stream->read_bool();
+  _klass = read_from(stream);
+  assert(_klass->is_constant_oop(), "should be constant java mirror oop");
+  _source = read_from(stream);
+}
+
+void CloneObjectValue::write_on(DebugInfoWriteStream* stream) {
+  if (is_visited()) {
+    stream->write_int(OBJECT_ID_CODE);
+    stream->write_int(_id);
+  } else {
+    set_visited(true);
+    stream->write_int(CLONE_OBJECT_CODE);
+    stream->write_int(_id);
+    stream->write_bool(_is_root);
+    _klass->write_on(stream);
+    _source->write_on(stream);
   }
 }
 

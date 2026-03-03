@@ -175,6 +175,7 @@ class RootNode;
 class SafePointNode;
 class SafePointScalarObjectNode;
 class SafePointScalarMergeNode;
+class SafePointScalarCloneNode;
 class SaturatingVectorNode;
 class StartNode;
 class State;
@@ -763,6 +764,7 @@ public:
           DEFINE_CLASS_ID(ConI, Con, 0)
       DEFINE_CLASS_ID(SafePointScalarMerge, Type, 9)
       DEFINE_CLASS_ID(Convert, Type, 10)
+      DEFINE_CLASS_ID(SafePointScalarClone, Type, 11)
 
 
     DEFINE_CLASS_ID(Proj,  Node, 3)
@@ -1019,6 +1021,7 @@ public:
   DEFINE_CLASS_QUERY(SafePoint)
   DEFINE_CLASS_QUERY(SafePointScalarObject)
   DEFINE_CLASS_QUERY(SafePointScalarMerge)
+  DEFINE_CLASS_QUERY(SafePointScalarClone)
   DEFINE_CLASS_QUERY(Start)
   DEFINE_CLASS_QUERY(Store)
   DEFINE_CLASS_QUERY(Sub)

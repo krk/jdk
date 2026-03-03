@@ -787,6 +787,31 @@ void PhaseOutput::FillLocArray( int idx, MachSafePointNode* sfpt, Node *local,
     }
     array->append(mv);
     return;
+  } else if (local->is_SafePointScalarClone()) {
+    SafePointScalarCloneNode* scln = local->as_SafePointScalarClone();
+    CloneObjectValue* cv = (CloneObjectValue*) sv_for_node_id(objs, scln->_idx);
+    if (cv == nullptr) {
+      const Type *t = scln->bottom_type();
+      ciKlass* cik = t->is_oopptr()->exact_klass();
+
+      // Get source node from SafePoint's scalar area
+      uint src_ind = scln->src_index(sfpt->jvms());
+      Node* src_node = sfpt->in(src_ind);
+      OptoReg::Name src_reg = C->regalloc()->get_reg_first(src_node);
+      ScopeValue* src_sv;
+      if (src_node->bottom_type()->base() == Type::NarrowOop) {
+        src_sv = new_loc_value(C->regalloc(), src_reg, Location::narrowoop);
+      } else {
+        src_sv = new_loc_value(C->regalloc(), src_reg, Location::oop);
+      }
+
+      cv = new CloneObjectValue(scln->_idx,
+               new ConstantOopWriteValue(cik->java_mirror()->constant_encoding()),
+               src_sv);
+      set_sv_for_object_node(objs, cv);
+    }
+    array->append(cv);
+    return;
   }
 
   // Grab the register number for the local
@@ -973,7 +998,7 @@ bool PhaseOutput::contains_as_scalarized_obj(JVMState* jvms, MachSafePointNode* 
     // Other kinds of nodes that we may encounter here, for instance constants
     // representing values of fields of objects scalarized, aren't relevant for
     // us, since they don't map to ObjectValue.
-    if (!n->is_SafePointScalarObject()) {
+    if (!n->is_SafePointScalarObject() && !n->is_SafePointScalarClone()) {
       continue;
     }
 
@@ -1121,6 +1146,29 @@ void PhaseOutput::Process_OopMap_Node(MachNode *mach, int current_offset) {
           }
         }
         scval = mv;
+      } else if (obj_node->is_SafePointScalarClone()) {
+        SafePointScalarCloneNode* scln = obj_node->as_SafePointScalarClone();
+        scval = PhaseOutput::sv_for_node_id(objs, scln->_idx);
+        if (scval == nullptr) {
+          const Type *t = scln->bottom_type();
+          ciKlass* cik = t->is_oopptr()->exact_klass();
+
+          uint src_ind = scln->src_index(youngest_jvms);
+          Node* src_node = sfn->in(src_ind);
+          OptoReg::Name src_reg = C->regalloc()->get_reg_first(src_node);
+          ScopeValue* src_sv;
+          if (src_node->bottom_type()->base() == Type::NarrowOop) {
+            src_sv = new_loc_value(C->regalloc(), src_reg, Location::narrowoop);
+          } else {
+            src_sv = new_loc_value(C->regalloc(), src_reg, Location::oop);
+          }
+
+          CloneObjectValue* cv = new CloneObjectValue(scln->_idx,
+                   new ConstantOopWriteValue(cik->java_mirror()->constant_encoding()),
+                   src_sv);
+          PhaseOutput::set_sv_for_object_node(objs, cv);
+          scval = cv;
+        }
       } else if (!obj_node->is_Con()) {
         OptoReg::Name obj_reg = C->regalloc()->get_reg_first(obj_node);
         if( obj_node->bottom_type()->base() == Type::NarrowOop ) {
