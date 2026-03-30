@@ -1878,8 +1878,15 @@ Node* VectorUnboxNode::Ideal(PhaseGVN* phase, bool can_reshape) {
         bool is_vector_mask = vbox_klass->is_subclass_of(ciEnv::current()->vector_VectorMask_klass());
         if (is_vector_mask) {
           // VectorUnbox (VectorBox vmask) ==> VectorMaskCast vmask
-          const TypeVect* vmask_type = TypeVect::makemask(out_vt->element_basic_type(), out_vt->length());
-          return new VectorMaskCastNode(value, vmask_type);
+          //
+          // Skip cast for same-size element types (Float<->Int, Double<->Long):
+          // mask bit representation is identical (all-zeros/all-ones per lane).
+          // Identity() returns the value directly for this case.
+          if (type2aelembytes(in_vt->element_basic_type()) !=
+              type2aelembytes(out_vt->element_basic_type())) {
+            const TypeVect* vmask_type = TypeVect::makemask(out_vt->element_basic_type(), out_vt->length());
+            return new VectorMaskCastNode(value, vmask_type);
+          }
         } else {
           // Vector type mismatch is only supported for masks, but sometimes it happens in pathological cases.
         }
@@ -1897,8 +1904,16 @@ Node* VectorUnboxNode::Identity(PhaseGVN* phase) {
   if (EnableVectorReboxing && n->Opcode() == Op_VectorBox) {
     if (Type::equals(bottom_type(), n->in(VectorBoxNode::Value)->bottom_type())) {
       return n->in(VectorBoxNode::Value); // VectorUnbox (VectorBox v) ==> v
-    } else {
-      // Handled by VectorUnboxNode::Ideal().
+    }
+    // For masks with same-size element types (e.g. Float<->Int, Double<->Long),
+    // the bit representation is identical, so return the value directly.
+    VectorBoxNode* vbox = static_cast<VectorBoxNode*>(n);
+    const TypeVect* in_vt = vbox->vec_type();
+    const TypeVect* out_vt = type()->is_vect();
+    if (in_vt->length() == out_vt->length() &&
+        vbox->box_type()->instance_klass()->is_subclass_of(ciEnv::current()->vector_VectorMask_klass()) &&
+        type2aelembytes(in_vt->element_basic_type()) == type2aelembytes(out_vt->element_basic_type())) {
+      return n->in(VectorBoxNode::Value);
     }
   }
   return this;
